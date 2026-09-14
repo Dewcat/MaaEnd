@@ -102,6 +102,14 @@ struct BaseNavSurface
 inline constexpr uint8_t kBaseNavOffMeshRegular = 0;
 inline constexpr uint8_t kBaseNavOffMeshExtended = 1;
 
+// BOML v2 起每条记录尾部带上烘焙期算好的答案:逐向可用位与两沿落在的三角。v1 那四个
+// 字节是写零的填充,读出来即"两向都不开、两沿都没落上" —— 与 v1 包本来就不带方向
+// 信息一致,规划器据此把这条记录当不存在,LINK 表怎么写就怎么走。
+inline constexpr uint32_t kBaseNavOffMeshTriangleNone = 0xFFFFFFFFU;
+// bit0 = 起→终可走,bit1 = 终→起可走。
+inline constexpr uint8_t kBaseNavDirOkStartEnd = 0x01U;
+inline constexpr uint8_t kBaseNavDirOkEndStart = 0x02U;
+
 struct BaseNavOffMeshLink
 {
     uint16_t zone_id = 0;
@@ -114,6 +122,17 @@ struct BaseNavOffMeshLink
     float radius = 0.0F;
     float cost_modifier = 0.0F;
     std::array<BaseNavVertex, 4> points;
+    // v2 字段。v1 包留默认值。
+    uint8_t dir_ok = 0;
+    uint32_t start_triangle = kBaseNavOffMeshTriangleNone;
+    uint32_t end_triangle = kBaseNavOffMeshTriangleNone;
+
+    // 这条记录带得动方向信息吗 —— 两沿都落上了才算。
+    bool anchored() const
+    {
+        return start_triangle != kBaseNavOffMeshTriangleNone && end_triangle != kBaseNavOffMeshTriangleNone
+               && start_triangle != end_triangle;
+    }
 };
 
 // v4 起包尾可以挂若干独立数据段,靠头里的段目录定位。四段原有数据一个字节不动,
