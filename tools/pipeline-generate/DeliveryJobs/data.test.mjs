@@ -48,6 +48,7 @@ function getDepotModeContext(task, depot) {
         deliveryNode: `DeliveryJobsEnter${depot.Id}DeliveryJob`,
         cargoNode: `DeliveryJobsEnter${depot.Id}Cargo`,
         cargoCheckNode: `DeliveryJobsCheck${depot.Id}Cargo`,
+        ongoingNode: `DeliveryJobsOngoingDeliveryFor${depot.Id}`,
     };
 }
 
@@ -152,7 +153,9 @@ test("DeliveryJobs leaves locked depot handling to SceneManager", () => {
 test("DeliveryJobs generated depot nodes enter the shared transfer and cargo flows", () => {
     for (const depot of deliveryJobDepots) {
         const pipeline = readGeneratedPipeline("DeliveryJobs", "Depot", depot.RegionId, `${depot.Id}.json`);
-        assert.equal(pipeline[`DeliveryJobsEnter${depot.Id}DeliveryJob`].anchor, undefined);
+        assert.deepEqual(pipeline[`DeliveryJobsEnter${depot.Id}DeliveryJob`].anchor, {
+            DeliveryJobsReturnToDepotNode: "InLocalDepotNode",
+        });
         assert.deepEqual(pipeline[`DeliveryJobsEnter${depot.Id}DeliveryJob`].next, [
             "DeliveryJobsClickTransferJob",
         ]);
@@ -161,9 +164,16 @@ test("DeliveryJobs generated depot nodes enter the shared transfer and cargo flo
         assert.deepEqual(pipeline[`DeliveryJobsEnter${depot.Id}Cargo`].anchor, {
             DeliveryJobsSelectPriorityItems: `DeliveryJobsSelectPriorityItems${depot.RegionId}`,
             DeliveryJobsRedistributionBidAction: "DeliveryJobsRedistributionBidNextStep",
-            DeliveryJobsOngoingDeliveryAction: "DeliveryJobsStopForOngoingDelivery",
             DeliveryJobsAfterAcceptJob: "DeliveryJobsDeliverQuickly",
             DeliveryJobsGoToDepot: depot.DepotScene,
+            DeliveryJobsReturnToDepotNode: depot.DepotScene,
+        });
+        assert.deepEqual(pipeline[`DeliveryJobsOngoingDeliveryFor${depot.Id}`].next, [
+            "DeliveryJobsSkipOngoingDelivery",
+        ]);
+        assert.equal(pipeline[`DeliveryJobsOngoingDeliveryFor${depot.Id}`].pre_delay, 0);
+        assert.deepEqual(pipeline[`DeliveryJobsOngoingDeliveryFor${depot.Id}`].anchor, {
+            DeliveryJobsReturnToDepotNode: depot.DepotScene,
         });
         assert.deepEqual(pipeline[`DeliveryJobsEnter${depot.Id}Cargo`].next, [
             "DeliveryJobsPackCargo",
@@ -174,31 +184,48 @@ test("DeliveryJobs generated depot nodes enter the shared transfer and cargo flo
         assert.deepEqual(pipeline[`DeliveryJobsEnter${depot.Id}PriceDeliveryJob`].next, [
             "DeliveryJobsClickTransferJob",
         ]);
-        assert.equal(pipeline[`DeliveryJobsEnter${depot.Id}PriceDeliveryJob`].anchor, undefined);
-        assert.equal(pipeline[`DeliveryJobsOpenOngoingAutoDelivery${depot.Id}`].recognition, undefined);
-        assert.equal(pipeline[`DeliveryJobsOpenOngoingAutoDelivery${depot.Id}`].action, undefined);
-        assert.deepEqual(pipeline[`DeliveryJobsOpenOngoingAutoDelivery${depot.Id}`].anchor, {
-            DeliveryJobsAfterViewCurrentJob: `DeliveryJobsAutoDelivery${depot.Id}`,
+        assert.deepEqual(pipeline[`DeliveryJobsEnter${depot.Id}PriceDeliveryJob`].anchor, {
+            DeliveryJobsReturnToDepotNode: "InLocalDepotNode",
         });
-        assert.deepEqual(pipeline[`DeliveryJobsOpenOngoingAutoDelivery${depot.Id}`].next, [
-            `DeliveryJobsReturnAndView${depot.Id}CurrentJob`,
-        ]);
+        assert.equal(pipeline[`DeliveryJobsOpenOngoingAutoDelivery${depot.Id}`], undefined);
+        assert.equal(pipeline[`DeliveryJobsReturnAndView${depot.Id}CurrentJob`], undefined);
+        assert.equal(pipeline[`DeliveryJobsView${depot.Id}CurrentJob`], undefined);
         assert.equal(pipeline[`DeliveryJobsStartAutoDelivery${depot.Id}`], undefined);
         assert.equal(pipeline[`DeliveryJobsConfigureAutoDelivery${depot.Id}`], undefined);
-        assert.deepEqual(pipeline[`DeliveryJobsReturnAndView${depot.Id}CurrentJob`].custom_action_param.sub, [
-            depot.DepotScene,
-        ]);
-        assert.deepEqual(pipeline[`DeliveryJobsReturnAndView${depot.Id}CurrentJob`].next, [
-            `DeliveryJobsView${depot.Id}CurrentJob`,
-        ]);
-        assert.deepEqual(pipeline[`DeliveryJobsView${depot.Id}CurrentJob`].all_of, [
-            `DeliveryJobsCheckLocalDepotNode${depot.Id}Text`,
-            `DeliveryJobsCheck${depot.Id}DeliveryJob`,
-        ]);
-        assert.deepEqual(pipeline[`DeliveryJobsView${depot.Id}CurrentJob`].next, [
-            "[Anchor]DeliveryJobsAfterViewCurrentJob",
-        ]);
-        assert.equal(pipeline[`DeliveryJobsView${depot.Id}CurrentJob`].post_wait_freezes, undefined);
+    }
+});
+
+test("DeliveryJobs returns to the current depot node through the DeliveryJobsReturnToDepotNode anchor", () => {
+    const transfer = readGeneratedPipeline("DeliveryJobs", "TransferJob.json");
+    const cargo = readGeneratedPipeline("DeliveryJobs", "PackCargo.json");
+    const autoDelivery = readGeneratedPipeline("DeliveryJobs", "AutoDelivery.json");
+    assert.deepEqual(transfer.DeliveryJobsConfirmTaskTransfer.next, [
+        "[Anchor]DeliveryJobsReturnToDepotNode",
+    ]);
+    assert.deepEqual(cargo.DeliveryJobsSkipOngoingDelivery.next, [
+        "[Anchor]DeliveryJobsReturnToDepotNode",
+    ]);
+    // 共享步骤不声明该锚点
+    assert.equal(transfer.DeliveryJobsTransferOngoingJob.anchor, undefined);
+    assert.equal(transfer.DeliveryJobsClickTransferJob.anchor, undefined);
+    assert.equal(autoDelivery.DeliveryJobsDeliverByAutoDelivery.anchor, undefined);
+    for (const depot of deliveryJobDepots) {
+        const pipeline = readGeneratedPipeline("DeliveryJobs", "Depot", depot.RegionId, `${depot.Id}.json`);
+        // 仓储节点界面发起的转交落在 InLocalDepotNode
+        for (const entry of [
+            `DeliveryJobsEnter${depot.Id}DeliveryJob`,
+            `DeliveryJobsEnter${depot.Id}PriceDeliveryJob`,
+        ]) {
+            assert.equal(pipeline[entry].anchor.DeliveryJobsReturnToDepotNode, "InLocalDepotNode");
+        }
+        // 任务界面发起时落在本仓储节点的场景节点
+        for (const entry of [
+            `DeliveryJobsEnter${depot.Id}Cargo`,
+            `DeliveryJobsOngoingDeliveryFor${depot.Id}`,
+            `DeliveryJobsAutoDelivery${depot.Id}`,
+        ]) {
+            assert.equal(pipeline[entry].anchor.DeliveryJobsReturnToDepotNode, depot.DepotScene);
+        }
     }
 });
 
@@ -240,11 +267,13 @@ test("DeliveryJobs task registers region switches and the shared packing option"
     assert.deepEqual(task.task[0].option, [
         ...deliveryJobRegions.map((region) => region.Id),
         "PackCargoSelectItem",
-        "DeliveryJobsAutoDeliveryRiskAcknowledgement",
         "DeliveryJobsAutoDeliveryPreferZipline",
+        "DeliveryJobsOngoingDeliveryFallback",
     ]);
     assert.equal(task.option.DeliveryJobsAcceptJobOnly, undefined);
     assert.equal(task.option.DeliveryJobsPackCargoOnly, undefined);
+    assert.equal(task.option.DeliveryJobsAutoDeliveryRiskAcknowledgement, undefined);
+    assert.equal(task.option.DeliveryJobsAutoDeliveryGuard, undefined);
 });
 
 test("SeizeDeliveryJobs applies the shared zipline preference to AutoDelivery navigation nodes", () => {
@@ -370,19 +399,85 @@ test("DeliveryJobs task adds automatic delivery as an independent supported-depo
     }
 });
 
+test("DeliveryJobs derives automatic delivery support from delivery destinations", () => {
+    const catalog = readJsonc(new URL("../data/delivery_destinations.json", import.meta.url));
+    const depotIdsWithDestination = new Set(
+        catalog.destinations.map((destination) => destination.depot_id).filter(Boolean),
+    );
+    for (const depot of deliveryJobDepots) {
+        assert.equal(
+            depot.AutoDeliverySupported,
+            depotIdsWithDestination.has(depot.GameId),
+            `${depot.Id} 的自动送货支持标记与 delivery_destinations.json 不一致`,
+        );
+    }
+});
+
+test("DeliveryJobs ongoing delivery area names map back to the owning depot id", () => {
+    const catalog = readJsonc(new URL("../data/delivery_destinations.json", import.meta.url));
+    const areaNamesByDepot = new Map();
+    for (const destination of catalog.destinations) {
+        if (!destination.depot_id) {
+            continue;
+        }
+        const names = areaNamesByDepot.get(destination.depot_id) ?? new Set();
+        names.add(destination.area.en_us);
+        areaNamesByDepot.set(destination.depot_id, names);
+    }
+
+    for (const depot of deliveryJobDepots) {
+        const areaNames = areaNamesByDepot.get(depot.GameId);
+        if (areaNames === undefined) {
+            continue;
+        }
+        // Go 侧 area.ID 由 en_us 区域名去掉非字母数字得到，和生成器的 MaaEnd ID 规则一致；
+        // DeliveryJobsResolveOngoingDepotAction 用它拼分派节点名，两边必须落在同一个字符串上。
+        for (const areaName of areaNames) {
+            assert.equal(areaName.replace(/[^A-Za-z0-9]+/g, ""), depot.Id);
+        }
+    }
+});
+
+test("DeliveryJobs dispatches the ongoing delivery job through the owning depot mode", () => {
+    const task = readGeneratedTask();
+    for (const depot of deliveryJobDepots) {
+        const {byName, ongoingNode} = getDepotModeContext(task, depot);
+        const expectedNext = {
+            Transfer: "DeliveryJobsTransferOngoingJob",
+            AutoDelivery: `DeliveryJobsAutoDelivery${depot.Id}`,
+            ByQuote: "DeliveryJobsSkipOngoingDelivery",
+            AcceptJobOnly: "DeliveryJobsSkipOngoingDelivery",
+            PackCargoOnly: "DeliveryJobsSkipOngoingDelivery",
+        };
+
+        for (const [
+            mode,
+            next,
+        ] of Object.entries(expectedNext)) {
+            const modeCase = byName[mode];
+            if (modeCase === undefined) {
+                assert.equal(depot.AutoDeliverySupported, false);
+                continue;
+            }
+            assert.deepEqual(modeCase.pipeline_override[ongoingNode].next, [
+                next,
+            ]);
+        }
+    }
+});
+
 test("DeliveryJobs ordinary depot modes override delivery and cargo behavior", () => {
     const task = readGeneratedTask();
     for (const depot of deliveryJobDepots) {
-        const {byName, deliveryNode, cargoNode, cargoCheckNode} = getDepotModeContext(task, depot);
+        const {byName, deliveryNode, cargoNode, cargoCheckNode, ongoingNode} = getDepotModeContext(task, depot);
         assert.equal(byName.Transfer.pipeline_override[deliveryNode].enabled, true);
         assert.equal(
             byName.Transfer.pipeline_override[cargoNode].anchor.DeliveryJobsRedistributionBidAction,
             "DeliveryJobsRedistributionBidNextStep",
         );
-        assert.equal(
-            byName.Transfer.pipeline_override[cargoNode].anchor.DeliveryJobsOngoingDeliveryAction,
-            "DeliveryJobsStopForOngoingDelivery",
-        );
+        assert.deepEqual(byName.Transfer.pipeline_override[ongoingNode].next, [
+            "DeliveryJobsTransferOngoingJob",
+        ]);
         assert.equal(byName.Transfer.pipeline_override[cargoNode].anchor.DeliveryJobsGoToDepot, depot.DepotScene);
 
         assert.equal(byName.PackCargoOnly.pipeline_override[deliveryNode].enabled, false);
@@ -390,18 +485,16 @@ test("DeliveryJobs ordinary depot modes override delivery and cargo behavior", (
             byName.PackCargoOnly.pipeline_override[cargoNode].anchor.DeliveryJobsRedistributionBidAction,
             "DeliveryJobsBackToDepotFromBid",
         );
-        assert.equal(
-            byName.PackCargoOnly.pipeline_override[cargoNode].anchor.DeliveryJobsOngoingDeliveryAction,
+        assert.deepEqual(byName.PackCargoOnly.pipeline_override[ongoingNode].next, [
             "DeliveryJobsSkipOngoingDelivery",
-        );
+        ]);
         assert.equal(byName.PackCargoOnly.pipeline_override[cargoNode].anchor.DeliveryJobsGoToDepot, depot.DepotScene);
         assert.equal(byName.PackCargoOnly.pipeline_override[cargoCheckNode].expected.includes("查看报价"), false);
 
         assert.equal(byName.AcceptJobOnly.pipeline_override[deliveryNode].enabled, false);
-        assert.equal(
-            byName.AcceptJobOnly.pipeline_override[cargoNode].anchor.DeliveryJobsOngoingDeliveryAction,
-            "DeliveryJobsStopForOngoingDelivery",
-        );
+        assert.deepEqual(byName.AcceptJobOnly.pipeline_override[ongoingNode].next, [
+            "DeliveryJobsSkipOngoingDelivery",
+        ]);
         assert.equal(byName.AcceptJobOnly.pipeline_override[cargoNode].anchor.DeliveryJobsGoToDepot, depot.DepotScene);
         assert.equal(byName.AcceptJobOnly.option, undefined);
 
@@ -429,7 +522,6 @@ test("DeliveryJobs exposes automatic delivery for supported depots with shared s
         const ordinaryAutoOverride = byName.AutoDelivery.pipeline_override;
         const deliveryNode = `DeliveryJobsEnter${depot.Id}DeliveryJob`;
         const cargoNode = `DeliveryJobsEnter${depot.Id}Cargo`;
-        const openOngoingAutoDelivery = `DeliveryJobsOpenOngoingAutoDelivery${depot.Id}`;
         const autoDelivery = `DeliveryJobsAutoDelivery${depot.Id}`;
         assert.deepEqual(ordinaryAutoOverride[deliveryNode], {
             enabled: true,
@@ -438,10 +530,13 @@ test("DeliveryJobs exposes automatic delivery for supported depots with shared s
         assert.deepEqual(ordinaryAutoOverride[cargoNode].anchor, {
             DeliveryJobsSelectPriorityItems: `DeliveryJobsSelectPriorityItems${depot.RegionId}`,
             DeliveryJobsRedistributionBidAction: "DeliveryJobsRedistributionBidNextStep",
-            DeliveryJobsOngoingDeliveryAction: openOngoingAutoDelivery,
             DeliveryJobsAfterAcceptJob: "DeliveryJobsDeliverQuickly",
             DeliveryJobsGoToDepot: autoDelivery,
+            DeliveryJobsReturnToDepotNode: depot.DepotScene,
         });
+        assert.deepEqual(ordinaryAutoOverride[`DeliveryJobsOngoingDeliveryFor${depot.Id}`].next, [
+            autoDelivery,
+        ]);
         assert.equal(ordinaryAutoOverride.AutoDeliveryOpenCurrentJobDetail, undefined);
         assert.equal(ordinaryAutoOverride.AutoDeliveryPostDepartureEntry, undefined);
         assert.equal(ordinaryAutoOverride.SeizeDeliveryJobsPostProcessingEntry, undefined);
@@ -466,23 +561,6 @@ test("DeliveryJobs exposes automatic delivery for supported depots with shared s
         }
     }
 
-    assert.equal(task.option.DeliveryJobsAutoDeliveryRiskAcknowledgement.controller, undefined);
-    assert.equal(task.option.DeliveryJobsAutoDeliveryRiskAcknowledgement.default_case, "No");
-    assert.deepEqual(
-        task.option.DeliveryJobsAutoDeliveryRiskAcknowledgement.cases.map((item) => item.pipeline_override),
-        [
-            {
-                DeliveryJobsAutoDeliveryGuard: {
-                    enabled: true,
-                },
-            },
-            {
-                DeliveryJobsAutoDeliveryGuard: {
-                    enabled: false,
-                },
-            },
-        ],
-    );
     assert.equal(task.option.DeliveryJobsAutoDeliveryPreferZipline.controller, undefined);
     assert.equal(task.option.DeliveryJobsAutoDeliveryPreferZipline.default_case, "No");
     for (const [
@@ -507,10 +585,32 @@ test("DeliveryJobs exposes automatic delivery for supported depots with shared s
     }
 });
 
+test("DeliveryJobs ongoing delivery fallback overrides the shared call node once", () => {
+    const task = readGeneratedTask();
+    const fallback = task.option.DeliveryJobsOngoingDeliveryFallback;
+    assert.equal(fallback.type, "switch");
+    assert.equal(fallback.default_case, "No");
+    assert.equal(fallback.cases.length, 2);
+
+    const noCase = fallback.cases.find((itemCase) => itemCase.name === "No");
+    assert.equal(noCase.pipeline_override, undefined);
+
+    const yesCase = fallback.cases.find((itemCase) => itemCase.name === "Yes");
+    assert.deepEqual(Object.keys(yesCase.pipeline_override), ["DeliveryJobsDeliverByAutoDelivery"]);
+    assert.deepEqual(yesCase.pipeline_override.DeliveryJobsDeliverByAutoDelivery.on_error, [
+        "DeliveryJobsTransferOngoingJob",
+    ]);
+
+    // 不再为每个仓储节点重复覆盖 on_error
+    for (const depot of deliveryJobDepots) {
+        assert.equal(yesCase.pipeline_override[`DeliveryJobsAutoDelivery${depot.Id}`], undefined);
+    }
+});
+
 test("DeliveryJobs quote mode registers threshold and branch action options", () => {
     const task = readGeneratedTask();
     for (const depot of deliveryJobDepots) {
-        const {byName, deliveryNode, cargoNode} = getDepotModeContext(task, depot);
+        const {byName, deliveryNode, cargoNode, ongoingNode} = getDepotModeContext(task, depot);
         assert.deepEqual(byName.ByQuote.option, [
             `DeliveryJobsQuoteThreshold${depot.Id}`,
             `DeliveryJobsAtLeastMinimumQuoteAction${depot.Id}`,
@@ -522,10 +622,9 @@ test("DeliveryJobs quote mode registers threshold and branch action options", ()
             byName.ByQuote.pipeline_override[cargoNode].anchor.DeliveryJobsRedistributionBidAction,
             `DeliveryJobsDecide${depot.Id}Quote`,
         );
-        assert.equal(
-            byName.ByQuote.pipeline_override[cargoNode].anchor.DeliveryJobsOngoingDeliveryAction,
-            "DeliveryJobsStopForOngoingDelivery",
-        );
+        assert.deepEqual(byName.ByQuote.pipeline_override[ongoingNode].next, [
+            "DeliveryJobsSkipOngoingDelivery",
+        ]);
         assert.equal(byName.ByQuote.pipeline_override[cargoNode].anchor.DeliveryJobsGoToDepot, depot.DepotScene);
     }
 });
@@ -788,19 +887,48 @@ test("DeliveryJobs shared bid page dispatches through common quote actions", () 
     ]);
     assert.equal(pipeline.DeliveryJobsQuoteDoNotAcceptStopped, undefined);
     assert.deepEqual(pipeline.DeliveryJobsOngoingDelivery.next, [
-        "[Anchor]DeliveryJobsOngoingDeliveryAction",
+        "DeliveryJobsEnsureOngoingDeliveryMission",
     ]);
     assert.equal(pipeline.DeliveryJobsOngoingDelivery.action, undefined);
-    assert.equal(pipeline.DeliveryJobsStopForOngoingDelivery.action, "StopTask");
+    assert.equal(pipeline.DeliveryJobsOngoingDelivery.anchor, undefined);
+    assert.deepEqual(pipeline.DeliveryJobsEnsureOngoingDeliveryMission.custom_action_param, {
+        sub: [
+            "AutoDeliveryEnsureDeliveryMissionSelected",
+        ],
+        continue: false,
+        strict: true,
+    });
+    assert.deepEqual(pipeline.DeliveryJobsEnsureOngoingDeliveryMission.next, [
+        "DeliveryJobsResolveOngoingDepot",
+    ]);
+    assert.deepEqual(pipeline.DeliveryJobsResolveOngoingDepot.all_of, [
+        "AutoDeliveryInDeliveryMissionDetail",
+        "AutoDeliveryCheckAreaText",
+    ]);
+    assert.equal(pipeline.DeliveryJobsResolveOngoingDepot.box_index, 1);
+    assert.equal(pipeline.DeliveryJobsResolveOngoingDepot.custom_action, "DeliveryJobsResolveOngoingDepotAction");
+    assert.deepEqual(pipeline.DeliveryJobsResolveOngoingDepot.next, [
+        "DeliveryJobsSkipOngoingDelivery",
+    ]);
     assert.deepEqual(pipeline.DeliveryJobsSkipOngoingDelivery.next, [
-        "DeliveryJobsBackToDepotFromBid",
+        "[Anchor]DeliveryJobsReturnToDepotNode",
     ]);
 });
 
 test("DeliveryJobs and SeizeDeliveryJobs compose AutoDelivery through continuation anchors", () => {
     const shared = readGeneratedPipeline("DeliveryJobs", "AutoDelivery.json");
-    assert.equal(shared.DeliveryJobsAutoDeliveryGuard.action, "StopTask");
-    assert.equal(shared.DeliveryJobsAutoDeliveryGuard.enabled, true);
+    assert.equal(shared.DeliveryJobsAutoDeliveryGuard, undefined);
+    assert.equal(shared.DeliveryJobsDeliverByAutoDelivery.custom_action, "SubTask");
+    assert.deepEqual(shared.DeliveryJobsDeliverByAutoDelivery.custom_action_param, {
+        sub: [
+            "AutoDelivery",
+        ],
+        continue: false,
+        strict: true,
+    });
+    assert.deepEqual(shared.DeliveryJobsDeliverByAutoDelivery.next, [
+        "[Anchor]DeliveryJobsAfterAutoDelivery",
+    ]);
     for (const node of [
         "DeliveryJobsAutoDeliveryDone",
         "DeliveryJobsAutoDeliveryFailed",
@@ -820,11 +948,11 @@ test("DeliveryJobs and SeizeDeliveryJobs compose AutoDelivery through continuati
     for (const depot of deliveryJobDepots) {
         const pipeline = readGeneratedPipeline("DeliveryJobs", "Depot", depot.RegionId, `${depot.Id}.json`);
         assert.deepEqual(pipeline[`DeliveryJobsAutoDelivery${depot.Id}`].anchor, {
-            AutoDeliveryAfterSubmitGoods: `DeliveryJobs${depot.RegionId}Loop`,
+            DeliveryJobsAfterAutoDelivery: `DeliveryJobs${depot.RegionId}Loop`,
+            DeliveryJobsReturnToDepotNode: depot.DepotScene,
         });
         assert.deepEqual(pipeline[`DeliveryJobsAutoDelivery${depot.Id}`].next, [
-            "DeliveryJobsAutoDeliveryGuard",
-            "AutoDelivery",
+            "DeliveryJobsDeliverByAutoDelivery",
         ]);
         assert.equal(pipeline[`DeliveryJobsAutoDelivery${depot.Id}`].focus, undefined);
         for (const node of [
@@ -1457,12 +1585,15 @@ test("AutoDelivery ensures the delivery mission detail before branching", () => 
         "AutoDeliverySkipChat",
     ]);
     assert.equal(delivery.AutoDeliverySkipChat.action, "TouchMove");
-    assert.deepEqual(delivery.AutoDeliverySkipChat.target, [
-        0,
-        0,
-        1,
-        1,
-    ]);
+    assert.deepEqual(
+        delivery.AutoDeliverySkipChat.target,
+        [
+            0,
+            0,
+            1,
+            1,
+        ],
+    );
     assert.deepEqual(delivery.AutoDeliverySkipChat.next, [
         "AutoDeliveryCheckSkipChatAfterMoveAway",
     ]);
@@ -1474,10 +1605,7 @@ test("AutoDelivery ensures the delivery mission detail before branching", () => 
         "AutoDeliverySkipChatMoveToButton",
     ]);
     assert.equal(delivery.AutoDeliverySkipChatMoveToButton.action, "TouchMove");
-    assert.equal(
-        delivery.AutoDeliverySkipChatMoveToButton.target,
-        "AutoDeliveryCheckSkipChatAfterMoveAway",
-    );
+    assert.equal(delivery.AutoDeliverySkipChatMoveToButton.target, "AutoDeliveryCheckSkipChatAfterMoveAway");
     assert.deepEqual(delivery.AutoDeliverySkipChatMoveToButton.next, [
         "AutoDeliverySkipChatClick",
     ]);
@@ -1546,9 +1674,7 @@ test("DeliveryJobs stops only at explicit safety boundaries", () => {
         })
         .sort();
     assert.deepEqual(stopNodes, [
-        "DeliveryJobsAutoDeliveryGuard",
         "DeliveryJobsBidPriceRecognitionFailed",
-        "DeliveryJobsStopForOngoingDelivery",
     ]);
 });
 
