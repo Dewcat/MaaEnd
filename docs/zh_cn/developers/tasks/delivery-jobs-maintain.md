@@ -12,52 +12,75 @@
 
 ## 流程总览
 
-```text
-DeliveryJobsMain
-  └─ DeliveryJobsLoop                    只支持从地区建设界面开始（识别 InRegionalDevelopment）
-       ├─ DeliveryJobsAuto               首次进入：按当前所在地区自动选起始地区（max_hit 1）
-       │    └─ DeliveryJobsAuto{Region}  Or(InRegionalDevelopment{Region}, DeliveryJobsIn{Region}LocalDepotNode)
-       ├─ DeliveryJobs{Region}           SubTask 进本地区地区建设 → DeliveryJobs{Region}Loop
-       └─ DeliveryJobsFinished
+### 图例
 
-每个地区（DeliveryJobs{Region}Loop，anchor: DeliveryJobsGoToDepot = 本地区仓储节点场景）
-  ├─ SubTask 先进本地区仓储节点场景
-  ├─ [JumpBack] DeliveryJobsEnter{Depot}DeliveryJob   × 本地区每个仓储节点：查看任务 → 转交
-  ├─ [JumpBack] DeliveryJobsEnter{Depot}Cargo         × 本地区每个仓储节点：进入货物 → 装箱
-  ├─ DeliveryJobsLoop                                 下一个地区
-  └─ [JumpBack] SceneEnterMenuRegionalDevelopment     回地区建设界面
+图中用形状区分节点角色，节点标签里的 `设 X` / `用 X` 标出锚点：
+
+| 形状 | 含义 |
+| ------------------ | ---------------------------------------------------- |
+| 圆角矩形 `([])` | 任务或循环的边界节点 |
+| 矩形 `[]` | 普通 Pipeline 节点 |
+| **六边形 `{{}}`** | **声明 anchor 的节点**（节点带 `anchor` 字段） |
+| **菱形 `{}`** | **读取 anchor 的节点**（`next` 里写 `[Anchor]X`） |
+| 实线 | 模板里的固定连线 |
+| 虚线 | 由 option 覆盖产生的连线 |
+
+`{Depot}` 指代当前仓储节点的 MaaEnd 标识（如 `OriginiumSciencePark`），`{Region}` 同理（如 `ValleyIV`）。
+
+### 图 1：任务入口与地区调度
+
+```mermaid
+flowchart TD
+    Main(["DeliveryJobsMain"]) --> Loop(["DeliveryJobsLoop\n主循环，只支持从地区建设界面开始"])
+    Main --> Menu["[JumpBack] SceneEnterMenuRegionalDevelopment\n回地区建设界面"]
+    Loop --> Auto(["DeliveryJobsAuto\n首次进入：按当前所在地区选起始地区"])
+    Loop --> RTask(["DeliveryJobs{Region}\nSubTask 进入本地区地区建设"])
+    Loop --> Fin(["DeliveryJobsFinished"])
+    Auto --> RAuto["DeliveryJobsAuto{Region}\nOr(InRegionalDevelopment{Region}, DeliveryJobsIn{Region}LocalDepotNode)"]
+    RAuto --> RTask
+    RAuto --> Loop
+    RTask --> RLoop(["DeliveryJobs{Region}Loop\n设 DeliveryJobsGoToDepot = 本地区仓储节点场景"])
 ```
 
-地区循环的 `next` 里，同一个仓储节点的两个入口都带 `[JumpBack]`：任一入口的整条链（装箱、接取、转交、全自动送货、残留任务分派）跑完后回到循环节点，再试下一个候选。所以「处理完一个仓储节点后自动继续下一个」是循环节点重入实现的，不需要每个仓储节点自己声明后继。
+### 图 2：地区循环与仓储节点的两个入口
 
-进入仓储节点后，按该节点的处理方式分流：
+```mermaid
+flowchart TD
+    RLoop(["DeliveryJobs{Region}Loop\n设 DeliveryJobsGoToDepot = 本地区仓储节点场景"])
+    RLoop -->|"[JumpBack] × 本地区每个仓储节点"| EJob{{"DeliveryJobsEnter{Depot}DeliveryJob\n识别「查看任务」\n设 DeliveryJobsReturnToDepotNode = InLocalDepotNode"}}
+    RLoop -->|"[JumpBack] × 本地区每个仓储节点"| ECargo{{"DeliveryJobsEnter{Depot}Cargo\n识别「查看报价」/「货物装箱」\n设 SelectPriorityItems / RedistributionBidAction / AfterAcceptJob / GoToDepot / ReturnToDepotNode"}}
+    RLoop --> Next(["DeliveryJobsLoop\n下一个地区"])
+    RLoop --> Menu["[JumpBack] SceneEnterMenuRegionalDevelopment\n回地区建设界面"]
+```
 
-```text
-接取并转交（Transfer）
-  DeliveryJobsEnter{Depot}DeliveryJob ─> DeliveryJobsClickTransferJob ─> DeliveryJobsConfirmTaskTransfer
-                                                                          └─ [Anchor]DeliveryJobsReturnToDepotNode
+两个入口都带 `[JumpBack]`：任一入口的整条链（装箱、接取、转交、全自动送货、残留任务分派）跑完后回到循环节点，再试下一个候选。所以「处理完一个仓储节点后自动继续下一个」是循环节点重入实现的，不需要每个仓储节点自己声明后继。
 
-全自动送货（AutoDelivery）
-  DeliveryJobsEnter{Depot}DeliveryJob ─> DeliveryJobsAutoDelivery{Depot} ─> DeliveryJobsDeliverByAutoDelivery
-  （装箱接取后转交的入口改为 DeliveryJobsGoToDepot 锚点直连 DeliveryJobsAutoDelivery{Depot}）
-  失败 → on_error → DeliveryJobsTransferOngoingJob（仅在「送货失败后自动转交任务」开启时）
+### 图 3：装箱 → 调度申请界面 → 按处理方式分派
 
-按报价处理（ByQuote）
-  装箱 ─> 货物竞价 ─> 调度申请界面
-    ├─ DeliveryJobsOngoingDelivery            有残留货物 → 见「残留送货任务」
-    └─ [Anchor]DeliveryJobsRedistributionBidAction = DeliveryJobsDecide{Depot}Quote
-         ├─ 报价 ≥ 阈值 → DeliveryJobs{Depot}QuoteAtLeastMinimum → [Anchor]DeliveryJobsQuoteAction
-         ├─ 报价 < 阈值 → DeliveryJobs{Depot}QuoteBelowMinimum  → [Anchor]DeliveryJobsQuoteAction
-         └─ 识别不到报价 → DeliveryJobsBidPriceRecognitionFailed（停在报价页提示用户，不接取）
-
-仅接取委托（AcceptJobOnly）
-  装箱 ─> 调度申请界面 ─> 接取 ─> 回仓储节点，不转交
-
-仅装箱货物（PackCargoOnly）
-  装箱 ─> 调度申请界面 ─> 关闭页面回仓储节点，不接取
-
-不处理（Disabled）
-  两个入口节点都 enabled: false，该仓储节点既不接取也不装箱
+```mermaid
+flowchart TD
+    ECargo{{"DeliveryJobsEnter{Depot}Cargo\n设 5 个 anchor"}} --> Pack["DeliveryJobsPackCargo\n装箱货物"]
+    Pack --> PackGoods["DeliveryJobsInCargoPackGoods\n等「货物装箱」界面"]
+    PackGoods --> Sel["DeliveryJobsSelectTypeOfGoodsToPackNextStep\n选择装箱货物类型后下一步"]
+    Sel -->|默认| Fill["DeliveryJobsCargoFillToMax\n装满货物"]
+    Sel -.->|"启用「填入指定货物」\nnext = [Anchor]DeliveryJobsSelectPriorityItems"| Prio["装箱货物优先级\n见 图 7"]
+    Fill --> FillNext["DeliveryJobsFillToMaxNextStep\n装满货物后下一步"]
+    Prio --> FillNext
+    FillNext --> CargoBid["DeliveryJobsCargoBid\n货物竞价"]
+    CargoBid --> Bid
+    FillNext --> Bid{"DeliveryJobsInCargoRedistributionBid\n等「调度申请」界面\n用 DeliveryJobsRedistributionBidAction"}
+    Bid -->|识别到已有待运送货物| Ong["DeliveryJobsOngoingDelivery\n残留送货任务 → 见 图 5"]
+    Bid -->|"[Anchor]DeliveryJobsRedistributionBidAction"| Mode{"本仓储节点的处理方式"}
+    Mode -->|接取并转交 / 全自动送货 / 仅接取委托| RB["DeliveryJobsRedistributionBidNextStep\n点确认接取任务"]
+    Mode -->|按报价处理| Decide["DeliveryJobsDecide{Depot}Quote\n见 图 4"]
+    Mode -->|仅装箱货物| FromBid["DeliveryJobsBackToDepotFromBid\n关闭调度申请界面 → InLocalDepotNode"]
+    RB -->|"若停在提示页（[Anchor]AfterAcceptJob）"| Quick["DeliveryJobsDeliverQuickly / DeliveryJobsClickScreenToContinue\n点掉「尽快送达」等提示"]
+    RB --> Back["DeliveryJobsBackToDepot\n等回到大世界（InWorld）"]
+    Quick --> Back
+    Back -->|"[Anchor]DeliveryJobsGoToDepot"| Land{"接取后去向（各模式不同）"}
+    Land -->|接取并转交 / 仅接取委托| LandScene["本仓储节点场景\n循环重入后由 Enter{Depot}DeliveryJob 触发转交"]
+    Land -->|全自动送货| LandAuto["DeliveryJobsAutoDelivery{Depot}\n见 图 6"]
+    Land -->|按报价处理（达标）| LandRT["DeliveryJobsReturnAndTransfer{Depot}\n回仓储节点后由 Enter{Depot}PriceDeliveryJob 触发转交"]
 ```
 
 ## 仓储节点处理方式
@@ -92,34 +115,68 @@ DeliveryJobsMain
 
 阈值与两侧动作的选项是**每个仓储节点独立**的（`DeliveryJobsQuoteThreshold{DepotId}`、`DeliveryJobsAtLeastMinimumQuoteAction{DepotId}`、`DeliveryJobsBelowMinimumQuoteAction{DepotId}`），只在该仓储节点选「按报价处理」时才出现。
 
+```mermaid
+flowchart TD
+    Bid{"调度申请界面\n[Anchor]RedistributionBidAction = DeliveryJobsDecide{Depot}Quote"} --> Decide["DeliveryJobsDecide{Depot}Quote\n按报价决定如何处理"]
+    Decide --> AtLeast{{"DeliveryJobs{Depot}QuoteAtLeastMinimum\n报价 ≥ 阈值\n设 QuoteAction、GoToDepot"}}
+    Decide --> Below{{"DeliveryJobs{Depot}QuoteBelowMinimum\n报价 < 阈值\n设 QuoteAction、GoToDepot"}}
+    Decide --> Fail["DeliveryJobsBidPriceRecognitionFailed\n识别不到报价：停在报价页提示用户，不接取"]
+    AtLeast --> QA{"[Anchor]DeliveryJobsQuoteAction"}
+    Below --> QA
+    QA -->|接取并转交| QT["DeliveryJobsQuoteTransferJob"]
+    QA -->|全自动送货 / 仅接取委托| QO["DeliveryJobsQuoteAcceptJobOnly"]
+    QA -->|不处理| QN["DeliveryJobsQuoteDoNotAccept → InLocalDepotNode"]
+    QT --> RB["DeliveryJobsRedistributionBidNextStep"]
+    QO --> RB
+    RB --> Back["DeliveryJobsBackToDepot"]
+    RB -.->|"[Anchor]AfterAcceptJob"| Quick["DeliveryJobsDeliverQuickly"]
+    Quick --> Back
+    Back -->|"[Anchor]GoToDepot"| Land["ReturnAndTransfer{Depot} / DeliveryJobsAutoDelivery{Depot} / 本仓储节点场景"]
+```
+
 实现要点：
 
 - 阈值以 `pipeline_type: string` 注入 `ExpressionRecognition.expression`，实际比较式是 `{DeliveryJobsSelectedBidPrice}>=<阈值>` 与 `{DeliveryJobsSelectedBidPrice}<{阈值}`。**`pipeline_type` 必须保持 `string`**：设为 `int` 会尝试把整个表达式转成整数，最终得到 `null`。
 - 两侧动作都是四选一，取值与仓储节点处理方式**不共用**：`接取并转交` / `全自动送货` / `仅接取委托` / `不处理`。没有「按报价处理」和「仅装箱货物」——报价页已经在接取环节，再嵌套一层报价没有意义。
-- 动作节点由 `DeliveryJobs{Depot}QuoteAtLeastMinimum` / `QuoteBelowMinimum` 声明两个锚点后交给 `[Anchor]DeliveryJobsQuoteAction`：
+- 动作节点由 `DeliveryJobs{Depot}QuoteAtLeastMinimum` / `DeliveryJobs{Depot}QuoteBelowMinimum` 声明两个锚点后交给 `[Anchor]DeliveryJobsQuoteAction`：
     - `DeliveryJobsQuoteAction` → 执行哪个动作：`DeliveryJobsQuoteTransferJob`（接取并返回仓储节点转交）、`DeliveryJobsQuoteAcceptJobOnly`（接取后继续）、`DeliveryJobsQuoteDoNotAccept`（关闭报价页不接取）；
     - `DeliveryJobsGoToDepot` → 接取完成后回仓储节点的方式，取值 `DeliveryJobsReturnAndTransfer{Depot}`（回仓储节点并转交）、`DeliveryJobsAutoDelivery{Depot}`（交给全自动送货）或本仓储节点场景（只回去）。
 - 报价 OCR 失败（`DeliveryJobsBidPriceRecognitionFailed`）直接 `StopTask` 并停在报价页，不猜、不自动接取。
 
 ## anchor 一览
 
-DeliveryJobs 的共享节点不知道自己在为哪个仓储节点服务，全靠 anchor 传递上下文。当前用到九个：
+DeliveryJobs 的共享节点不知道自己在为哪个仓储节点服务，全靠 anchor 传递上下文。当前用到九个，全部声明点与读取点都在 Pipeline 内，唯一例外是 `DeliveryJobsSelectPriorityItems`（读者在 `assets/tasks/DeliveryJobs.json` 的 option 里）：
 
-| anchor | 声明者 | 消费者 | 含义 |
+| anchor | 声明者 | 消费者 | 读取时所处界面 |
 | ------------------------------------ | ------------------------------------------------------------------------------- | ------------------------------------------ | -------------------------------------- |
-| `DeliveryJobsReturnToDepotNode` | `DeliveryJobsEnter{Depot}DeliveryJob`、`DeliveryJobsEnter{Depot}PriceDeliveryJob`、`DeliveryJobsEnter{Depot}Cargo`、`DeliveryJobsOngoingDeliveryFor{DepotId}`、`DeliveryJobsAutoDelivery{Depot}` | `DeliveryJobsConfirmTaskTransfer`、`DeliveryJobsSkipOngoingDelivery` | 本仓储节点的落点 |
-| `DeliveryJobsGoToDepot` | `DeliveryJobs{Region}Loop`、`DeliveryJobsEnter{Depot}Cargo`、`DeliveryJobs{Depot}QuoteAtLeastMinimum/BelowMinimum` | `DeliveryJobsBackToDepot` | 从大世界回仓储节点的下一步 |
-| `DeliveryJobsSelectPriorityItems` | `DeliveryJobsEnter{Depot}Cargo` | `DeliveryJobsSelectTypeOfGoodsToPackNextStep` | 本地区的装箱优先级入口 |
-| `DeliveryJobsRedistributionBidAction` | `DeliveryJobsEnter{Depot}Cargo` | `DeliveryJobsInCargoRedistributionBid` | 调度申请界面上的分派动作 |
-| `DeliveryJobsAfterAcceptJob` | `DeliveryJobsEnter{Depot}Cargo` | `DeliveryJobsRedistributionBidNextStep` | 接取任务后的去向 |
-| `DeliveryJobsQuoteAction` | `DeliveryJobs{Depot}QuoteAtLeastMinimum/BelowMinimum` | 同名节点自身的 `next` | 报价达标 / 不达标时执行哪个动作 |
-| `DeliveryJobsCurrentPriorityItem` | `DeliveryJobsStartFill{Region}Priority{1..4}` | `DeliveryJobsSelectPriorityItemLoop` | 当前优先级要查找的物品 |
-| `DeliveryJobsNextPriority` | `DeliveryJobsStartFill{Region}Priority{1..4}` | `DeliveryJobsFillCorrespondingGoods`、`DeliveryJobsItemListAtBottom` | 当前优先级装不满或列表已到底时试哪个后续优先级 |
-| `DeliveryJobsAfterAutoDelivery` | `DeliveryJobsAutoDelivery{Depot}` | `DeliveryJobsDeliverByAutoDelivery` | 全自动送货成功后回到地区循环 |
+| `DeliveryJobsReturnToDepotNode` | `DeliveryJobsEnter{Depot}DeliveryJob`、`DeliveryJobsEnter{Depot}PriceDeliveryJob`、`DeliveryJobsEnter{Depot}Cargo`、`DeliveryJobsOngoingDeliveryFor{DepotId}`、`DeliveryJobsAutoDelivery{Depot}` | `DeliveryJobsConfirmTaskTransfer`、`DeliveryJobsSkipOngoingDelivery` | 任务界面（转交确认弹窗 / 任务详情） |
+| `DeliveryJobsGoToDepot` | `DeliveryJobs{Region}Loop`、`DeliveryJobsEnter{Depot}Cargo`、`DeliveryJobs{Depot}QuoteAtLeastMinimum/BelowMinimum` | `DeliveryJobsBackToDepot` | 大世界 |
+| `DeliveryJobsSelectPriorityItems` | `DeliveryJobsEnter{Depot}Cargo` | `DeliveryJobsSelectTypeOfGoodsToPackNextStep`（在任务 option 里） | 货物装箱界面 |
+| `DeliveryJobsRedistributionBidAction` | `DeliveryJobsEnter{Depot}Cargo` | `DeliveryJobsInCargoRedistributionBid` | 调度申请界面 |
+| `DeliveryJobsAfterAcceptJob` | `DeliveryJobsEnter{Depot}Cargo` | `DeliveryJobsRedistributionBidNextStep` | 调度申请界面（点确认接取后） |
+| `DeliveryJobsQuoteAction` | `DeliveryJobs{Depot}QuoteAtLeastMinimum/BelowMinimum` | 同名节点自身的 `next` | 报价页 |
+| `DeliveryJobsCurrentPriorityItem` | `DeliveryJobsStartFill{Region}Priority{1..4}` | `DeliveryJobsSelectPriorityItemLoop` | 装箱物品列表 |
+| `DeliveryJobsNextPriority` | `DeliveryJobsStartFill{Region}Priority{1..4}` | `DeliveryJobsFillCorrespondingGoods`、`DeliveryJobsItemListAtBottom` | 装箱物品列表 |
+| `DeliveryJobsAfterAutoDelivery` | `DeliveryJobsAutoDelivery{Depot}` | `DeliveryJobsDeliverByAutoDelivery` | 送货结束后的界面 |
 
 ### `DeliveryJobsReturnToDepotNode`：本仓储节点的落点
 
-转交确认后要回到哪里，取决于这次转交是在哪个界面发起的：仓储节点界面发起的转交仍在仓储节点界面结束；任务界面发起的转交会落在菜单列表，需要重新进仓储节点。`DeliveryJobsConfirmTaskTransfer` 不判断界面，只按这个锚点跳转。规则是**谁知道自己正在处理哪个仓储节点，谁就声明它**：
+转交确认后要回到哪里，取决于这次转交是在哪个界面发起的：仓储节点界面发起的转交仍在仓储节点界面结束；任务界面发起的转交会落在菜单列表，需要重新进仓储节点。`DeliveryJobsConfirmTaskTransfer` 不判断界面，只按这个锚点跳转：
+
+```mermaid
+flowchart LR
+    A{{"DeliveryJobsEnter{Depot}DeliveryJob\n设 = InLocalDepotNode"}} --> C["DeliveryJobsClickTransferJob\n单击转交任务"]
+    B{{"DeliveryJobsEnter{Depot}PriceDeliveryJob\n设 = InLocalDepotNode"}} --> C
+    Ong{{"DeliveryJobsOngoingDeliveryFor{DepotId}\n设 = 本仓储节点场景"}} --> TOng["DeliveryJobsTransferOngoingJob\nSubTask AutoDeliveryOpenDeliveryMission"]
+    AutoD{{"DeliveryJobsAutoDelivery{Depot}\n设 = 本仓储节点场景"}} --> TOng
+    TOng --> C
+    C --> D["DeliveryJobsConfirmTaskTransfer\n确认转交任务"]
+    D --> E{"[Anchor]DeliveryJobsReturnToDepotNode"}
+    E -->|"= InLocalDepotNode"| F["仓储节点界面\n（节点自带 pre_wait_freezes，等界面加载完成）"]
+    E -->|"= 本仓储节点场景"| G["从菜单列表回到本仓储节点界面"]
+```
+
+规则是**谁知道自己正在处理哪个仓储节点，谁就声明它**：
 
 | 声明者 | 值 | 场景 |
 | ------------------------------------------ | ---------------- | ------------------------------------------------ |
@@ -141,18 +198,18 @@ DeliveryJobs 的共享节点不知道自己在为哪个仓储节点服务，全�
 
 在调度申请界面识别到「有待运送的货物，请先完成送货」时，`DeliveryJobsInCargoRedistributionBid` 的 `next` 会先命中 `DeliveryJobsOngoingDelivery`，进入残留任务处理，而不是执行本仓储节点的调度申请动作：
 
-```text
-DeliveryJobsOngoingDelivery            调度申请界面识别到已有待运送货物
-  └─ DeliveryJobsEnsureOngoingDeliveryMission   SubTask AutoDeliveryEnsureDeliveryMissionSelected
-  │                                            进任务界面并选中那条送货任务
-  └─ DeliveryJobsResolveOngoingDepot     识别 And(AutoDeliveryInDeliveryMissionDetail, AutoDeliveryCheckAreaText)
-       │                                 Go 动作 DeliveryJobsResolveOngoingDepotAction：
-       │                                 用任务详情「当前区域」的 OCR 文本匹配仓储节点，
-       │                                 把 next 覆盖为 DeliveryJobsOngoingDeliveryFor{DepotId}
-       └─ DeliveryJobsOngoingDeliveryFor{DepotId}   按该仓储节点的处理方式分派（next 由选项覆盖）
+```mermaid
+flowchart TD
+    Bid{"DeliveryJobsInCargoRedistributionBid\n调度申请界面"} -->|识别到已有待运送货物| Ong["DeliveryJobsOngoingDelivery"]
+    Ong --> Ensure["DeliveryJobsEnsureOngoingDeliveryMission\nSubTask AutoDeliveryEnsureDeliveryMissionSelected\n进任务界面并选中那条送货任务"]
+    Ensure --> Resolve["DeliveryJobsResolveOngoingDepot\nAnd(AutoDeliveryInDeliveryMissionDetail, AutoDeliveryCheckAreaText)\nGo: DeliveryJobsResolveOngoingDepotAction"]
+    Resolve -.->|"运行时把 next 覆盖为 DeliveryJobsOngoingDeliveryFor{DepotId}"| For{{"DeliveryJobsOngoingDeliveryFor{DepotId}\n设 DeliveryJobsReturnToDepotNode = 本仓储节点场景\nnext 由该仓储节点的处理方式覆盖"}}
+    For -->|接取并转交| T["DeliveryJobsTransferOngoingJob → ClickTransferJob → ConfirmTaskTransfer → [Anchor]ReturnToDepotNode"]
+    For -->|全自动送货| A["DeliveryJobsAutoDelivery{DepotId} → DeliverByAutoDelivery → [Anchor]AfterAutoDelivery"]
+    For -->|其余四种| S["DeliveryJobsSkipOngoingDelivery → [Anchor]ReturnToDepotNode"]
 ```
 
-分派依据是**残留任务归属仓储节点**的处理方式，与当前正在遍历哪个仓储节点无关——残留任务可能来自上一个仓储节点，也可能来自本次根本没遍历到的节点：
+`DeliveryJobsResolveOngoingDepotAction` 用任务详情「当前区域」的 OCR 文本匹配仓储节点，把 `next` 覆盖为对应的分派节点。分派依据是**残留任务归属仓储节点**的处理方式，与当前正在遍历哪个仓储节点无关——残留任务可能来自上一个仓储节点，也可能来自本次根本没遍历到的节点：
 
 | 归属仓储节点的处理方式 | 去向 | 结果 |
 | ------------------------------- | ---------------------------------- | ------------------------------------------ |
@@ -167,20 +224,45 @@ DeliveryJobsOngoingDelivery            调度申请界面识别到已有待运�
 
 ## 全自动送货
 
+```mermaid
+flowchart TD
+    EJob{{"DeliveryJobsEnter{Depot}DeliveryJob\n该模式把 next 覆盖为 DeliveryJobsAutoDelivery{Depot}"}} --> AutoD
+    GoTo{{"[Anchor]DeliveryJobsGoToDepot\n= DeliveryJobsAutoDelivery{Depot}（装箱接取后的入口）"}} --> AutoD
+    AutoD{{"DeliveryJobsAutoDelivery{Depot}\n设 AfterAutoDelivery = 本地区循环\n设 ReturnToDepotNode = 本仓储节点场景"}} --> ByAuto["DeliveryJobsDeliverByAutoDelivery\nSubTask AutoDelivery（strict）"]
+    ByAuto -->|成功| Done{"[Anchor]DeliveryJobsAfterAutoDelivery\n回到本地区循环节点"}
+    ByAuto -->|"失败：开关关闭（默认）"| Stop["停止整个任务"]
+    ByAuto -->|"失败：开关开启（on_error）"| TOng["DeliveryJobsTransferOngoingJob → ClickTransferJob → ConfirmTaskTransfer → [Anchor]ReturnToDepotNode"]
+```
+
 「全自动送货」只在 `delivery_destinations.json` 中有归属终点的仓储节点上提供——没有终点的仓储节点无处可送，仓储节点模式与两侧报价分支都不给出这个选项。
 
 - DeliveryJobs 不直接把 `AutoDelivery` 放进 `next`。各仓储节点的 `DeliveryJobsAutoDelivery{Depot}` 只负责声明回跳锚点（`DeliveryJobsAfterAutoDelivery`、`DeliveryJobsReturnToDepotNode`），再交给公共调用节点 `DeliveryJobsDeliverByAutoDelivery`。
 - `DeliveryJobsDeliverByAutoDelivery` 用 strict `SubTask` 包裹 `AutoDelivery`，组件内部任意环节失败都会浮现在自身动作上，`on_error` 只需在这一处配置。当前处于取货还是送货阶段由组件根据任务详情自行判断，调用方无需为详情切换配置额外入口或 anchor。
 - 「送货时优先使用滑索」开关通过 `AutoDeliveryNavigateDepot` / `AutoDeliveryNavigateDestination` 的 `attach.zip` 传给 AutoDelivery。它只允许导航在预计更快且滑索已供电、可正常上下索时使用滑索，不保证每条路线都会选择滑索。
 - 「送货失败后自动转交任务」开关把 `DeliveryJobsDeliverByAutoDelivery.on_error` 设为 `DeliveryJobsTransferOngoingJob`。关闭时全自动送货失败即停止整个任务；开启时改为自动转交当前任务并继续地区循环。该功能仍处于测试阶段。
-- 送货成功后由 `DeliveryJobsAfterAutoDelivery` 回到本地区循环节点。
 
 ## 装箱货物优先级
 
 启用「填入指定货物」后，`DeliveryJobsSelectTypeOfGoodsToPackNextStep` 的 `next` 从默认的「装满货物」改为 `[Anchor]DeliveryJobsSelectPriorityItems`，流程改走优先级查找。该选项按地区展开，每个地区可设 4 个优先级槽位（`WhatToFill{Region}Priority1..4`）。
 
+```mermaid
+flowchart TD
+    Sel["DeliveryJobsSelectTypeOfGoodsToPackNextStep"] -.->|"启用「填入指定货物」"| Entry{"[Anchor]DeliveryJobsSelectPriorityItems\n= DeliveryJobsSelectPriorityItems{Region}"}
+    Entry -->|"该地区启用了优先级"| Start{{"DeliveryJobsStartFill{Region}Priority{n}\n设 CurrentPriorityItem、NextPriority"}}
+    Entry -->|"该地区未启用"| Max["DeliveryJobsCargoFillToMax\n用游戏默认的填充至满"]
+    Start --> Reset["DeliveryJobsResetItemListLoop\n先把列表滚到顶部"]
+    Reset --> Loop["DeliveryJobsSelectPriorityItemLoop\n用 [Anchor]CurrentPriorityItem 查找该物品"]
+    Loop -->|找到| Item["DeliveryJobsSelectItemToFill{Region}Priority{n}\nIconRecognition（grid_type=shipment）"]
+    Item --> Fill["DeliveryJobsFillCorrespondingGoods\n单击进度条最右侧填到最大"]
+    Loop -->|"逐屏向上滑到列表底部仍未找到"| Bottom["DeliveryJobsItemListAtBottom"]
+    Fill -->|未装满| Next{"[Anchor]DeliveryJobsNextPriority"}
+    Bottom --> Next
+    Next -->|还有已配置槽位| Start
+    Next -->|所有已配置槽位都不行| Err["DeliveryJobsConfiguredFillItemsInsufficient\n停在装箱界面并报错"]
+```
+
 - 每个槽位独立配置物品，取值是稳定 item ID，显示名复用 `iconRecognition.name.*`；默认优先级 1 为砂叶粉末，优先级 2 至 4 为「不指定」。
-- 单个优先级的流程：`DeliveryJobsStartFill{Region}Priority{n}` 声明 `DeliveryJobsCurrentPriorityItem` / `DeliveryJobsNextPriority` → `DeliveryJobsResetItemListLoop`（列表滚到顶部）→ `DeliveryJobsSelectPriorityItemLoop` 用 IconRecognition（`grid_type=shipment`）从顶部完整查找该物品 → `DeliveryJobsFillCorrespondingGoods` 单击进度条最右侧填到最大 → 未装满、或列表滚到底仍未找到时走 `DeliveryJobsNextPriority` 试下一个已配置槽位。
+- 每个优先级槽位使用同一份地区物品列表，由生成器按地区各仓储节点 `fillable_items` 的交集算出。
 - 所有已配置物品都装不满时 `DeliveryJobsConfiguredFillItemsInsufficient` 报错并停在装箱界面，不静默继续。
 - 未启用该选项时走 `DeliveryJobsCargoFillToMax`，使用游戏默认的填充至满。
 
